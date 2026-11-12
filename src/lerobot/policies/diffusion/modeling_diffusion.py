@@ -43,6 +43,14 @@ from lerobot.policies.utils import (
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
+from .rtc_diffusion import (
+    DiffusionRTCGuide,
+    make_rtc_processor,
+    push_observation_to_queues,
+    rtc_enabled,
+    rtc_predict_action_chunk,
+)
+
 
 class DiffusionPolicy(PreTrainedPolicy):
     """
@@ -73,8 +81,21 @@ class DiffusionPolicy(PreTrainedPolicy):
         self._queues = None
 
         self.diffusion = DiffusionModel(config)
+        self.init_rtc_processor()
 
         self.reset()
+
+    def init_rtc_processor(self):
+        """(Re)build the RTC processor from `config.rtc_config` (lerobot-rollout calls this after setting it)."""
+        self.rtc_processor = make_rtc_processor(self)
+
+    def _rtc_enabled(self) -> bool:
+        return rtc_enabled(self.config)
+
+    def observe(self, batch: dict[str, Tensor]) -> None:
+        """RTC: push the current observation into the queues without inference (call every control step
+        at which `predict_action_chunk` is not called)."""
+        push_observation_to_queues(self, batch)
 
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
@@ -91,8 +112,30 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        inference_delay: int | None = None,
+        prev_chunk_left_over: Tensor | None = None,
+        **kwargs,
+    ) -> Tensor:
+        """Predict a chunk of actions given environment observations.
+
+        With RTC enabled (`config.rtc_config.enabled`), `batch` is the current observation (it is pushed
+        into the observation queues), the previous chunk's leftover is enforced, and the full executable
+        range `(B, horizon - n_obs_steps + 1, A)` is returned in normalized action space. See
+        `rtc_diffusion.rtc_predict_action_chunk` for the extra kwargs.
+        """
+        if self._rtc_enabled():
+            return rtc_predict_action_chunk(
+                self,
+                batch,
+                noise=noise,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_chunk_left_over,
+                **kwargs,
+            )
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         actions = self.diffusion.generate_actions(batch, noise=noise)
@@ -121,6 +164,12 @@ class DiffusionPolicy(PreTrainedPolicy):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
+        if self._rtc_enabled():
+            raise RuntimeError(
+                "RTC is not supported by select_action; use `observe` + `predict_action_chunk` "
+                "(e.g. lerobot-rollout --inference.type=rtc)."
+            )
+
         # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
         if ACTION in batch:
             batch.pop(ACTION)
@@ -213,6 +262,7 @@ class DiffusionModel(nn.Module):
         global_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
+        rtc_guide: DiffusionRTCGuide | None = None,
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -231,6 +281,10 @@ class DiffusionModel(nn.Module):
 
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
+        if rtc_guide is not None:
+            # Real-Time Chunking: guided / replacement reverse process (see rtc_diffusion.py).
+            return rtc_guide.denoise(self, sample, global_cond=global_cond, generator=generator)
+
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
             model_output = self.unet(
@@ -240,6 +294,7 @@ class DiffusionModel(nn.Module):
             )
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
+            # sample = self.noise_scheduler.step(model_output, t, sample, generator=generator, eta=0.1).prev_sample
 
         return sample
 

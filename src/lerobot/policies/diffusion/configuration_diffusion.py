@@ -21,6 +21,14 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
+from ..rtc.configuration_rtc import RTCConfig
+
+RTC_GUIDANCE_MODES = ("none", "guidance", "replacement")
+RTC_GUIDANCE_WEIGHT_CLIPS = ("pigdm", "flow")
+RTC_GUIDANCE_JACOBIANS = ("vjp", "identity")
+RTC_GUIDANCE_R2 = ("unit", "posterior")
+RTC_R2_CLIPS = ("relative", "literal")
+
 
 @PreTrainedConfig.register_subclass("diffusion")
 @dataclass
@@ -98,6 +106,38 @@ class DiffusionConfig(PreTrainedConfig):
         do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
             `LeRobotDataset` and `load_previous_and_future_frames` for more information. Note, this defaults
             to False as the original Diffusion Policy implementation does the same.
+        rtc_config: Real-Time Chunking (inference-time only, see `rtc_diffusion.py`). `None` or
+            `enabled=False` keeps the original synchronous behaviour bit-for-bit. When enabled,
+            `predict_action_chunk` returns the full executable range (`horizon - n_obs_steps + 1` steps)
+            and `select_action` must not be used. NOTE: `max_guidance_weight` (beta) defaults to the
+            flow-matching value; for diffusion it clips `1 / (1 - alpha_bar_t)` and should be swept.
+        rtc_guidance_mode: How the previous chunk is enforced when RTC is enabled. "guidance": PiGDM
+            inpainting guidance (RTC); "replacement": RePaint-style hard replacement of the W==1 slots
+            (no VJP); "none": no inpainting (naive async baseline).
+        rtc_constrain_past_actions: If True, also constrain the raw horizon slots
+            `[0, n_obs_steps - 1)` (actions before the current observation) to the actually executed
+            actions passed as `prev_executed_actions`, with weight 1.
+        rtc_guidance_weight_clip: How beta clips the guidance weight. "pigdm": `w = min(beta, 1/(1-a_t))`
+            (clips only the low-noise end). "flow": the exact LeRobot/RTC flow-matching clipping mapped to
+            VP variables, `w = sqrt(a_t/(1-a_t)) * min(beta, 1/sqrt(a_t(1-a_t)))` (clips both ends, so
+            beta has the same meaning as for pi0/smolvla). Both are identical when unclipped.
+        rtc_guidance_jacobian: "vjp" (default): exact vector-Jacobian product through the U-Net (PiGDM / RTC
+            paper). "identity": no backward pass; the Jacobian of the clean-action estimate is taken as the
+            identity in rectified-flow coordinates, which is what LeRobot's flow `RTCProcessor` effectively
+            computes (it evaluates the velocity before `x_t.requires_grad_()`). Much cheaper and much stronger
+            for policies whose x0 estimate barely depends on x_t.
+        rtc_guidance_r2: PiGDM's `r_t^2` (Var[x0 | x_t]). "unit" (default, paper): `1 - a_t`, i.e. a
+            N(0, I) action prior. "posterior": per-dimension Gaussian posterior variance
+            `s2 (1 - a_t) / (a_t s2 + 1 - a_t)` with `s2` the conditional variance of each (raw horizon,
+            action dim) element, estimated from `rtc_r2_num_samples` unguided chunks for the same
+            observation (extra cost: one batched unguided sampling pass per guided call). Experimental.
+        rtc_r2_num_samples: number of chunks used to estimate `s2` ("posterior" only).
+        rtc_r2_clip: how beta clips the per-dimension weight `1 / r2` ("posterior" only). "relative":
+            `w_d = w_unit(a_t, beta) * (1 - a_t) / r2_d`, i.e. beta clips the unit-prior weight exactly as
+            with "unit" and the posterior correction is applied on top. "literal": `rtc_guidance_weight_clip`
+            applied to `1 / r2_d` itself. Both are `1 / r2_d` when unclipped. "relative" amplifies the
+            correction by up to `(1 - a_t) / s2`; it is only stable if the model's Jacobian scales like `s2`
+            (a randomly initialised U-Net diverges).
     """
 
     # Inputs / output structure.
@@ -147,6 +187,16 @@ class DiffusionConfig(PreTrainedConfig):
     # Inference
     num_inference_steps: int | None = None
 
+    # Real-Time Chunking (inference only). Defaults keep the original behaviour.
+    rtc_config: RTCConfig | None = None
+    rtc_guidance_mode: str = "guidance"
+    rtc_constrain_past_actions: bool = False
+    rtc_guidance_weight_clip: str = "pigdm"
+    rtc_guidance_jacobian: str = "vjp"
+    rtc_guidance_r2: str = "unit"
+    rtc_r2_num_samples: int = 16
+    rtc_r2_clip: str = "relative"
+
     # Optimization
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
@@ -182,6 +232,28 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
             )
+
+        if self.rtc_guidance_mode not in RTC_GUIDANCE_MODES:
+            raise ValueError(
+                f"`rtc_guidance_mode` must be one of {RTC_GUIDANCE_MODES}. Got {self.rtc_guidance_mode}."
+            )
+        if self.rtc_guidance_weight_clip not in RTC_GUIDANCE_WEIGHT_CLIPS:
+            raise ValueError(
+                f"`rtc_guidance_weight_clip` must be one of {RTC_GUIDANCE_WEIGHT_CLIPS}. "
+                f"Got {self.rtc_guidance_weight_clip}."
+            )
+        if self.rtc_guidance_jacobian not in RTC_GUIDANCE_JACOBIANS:
+            raise ValueError(
+                f"`rtc_guidance_jacobian` must be one of {RTC_GUIDANCE_JACOBIANS}. Got {self.rtc_guidance_jacobian}."
+            )
+        if self.rtc_guidance_r2 not in RTC_GUIDANCE_R2:
+            raise ValueError(
+                f"`rtc_guidance_r2` must be one of {RTC_GUIDANCE_R2}. Got {self.rtc_guidance_r2}."
+            )
+        if self.rtc_r2_clip not in RTC_R2_CLIPS:
+            raise ValueError(f"`rtc_r2_clip` must be one of {RTC_R2_CLIPS}. Got {self.rtc_r2_clip}.")
+        if self.rtc_r2_num_samples < 2:
+            raise ValueError(f"`rtc_r2_num_samples` must be >= 2. Got {self.rtc_r2_num_samples}.")
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
